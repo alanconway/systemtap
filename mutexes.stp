@@ -61,23 +61,13 @@ probe process("/lib64/libpthread.so.0").function("pthread_mutex_lock").return {
 
 probe process("/lib64/libpthread.so.0").function("pthread_mutex_unlock") {
   if (target() == pid()) {
-    // TODO: There is a race here:
-    // - this thread does --mutex_locks[$mutex] and sees 0
-    // - another thread hits the lock probe and does ++mutex_locks[$mutex]
-    // - this thread does delete mutex_locks[$mutex] and nukes a non-0 value
-    // Consequence: we could miss contentions.
-    // We detect if this happens (eventually we'll get count < 0) and report it.
-    //
-    count = --mutex_locks[$mutex]
-    if (count <= 0)
+    // NOTE:
+    // 1. Systemtap locks any global arrays we touch for the duration
+    // of the probe so there is no race here.
+    // 2. We can get count < 0 in the case that a mutex was locked before
+    // the script started executing and so was not counted.
+    if (--mutex_locks[$mutex] <= 0)
       delete mutex_locks[$mutex];
-    if (count < 0) {
-      if (++mutex_missed[$mutex] == 1) {
-	printf("mutex %p: invalid lock count\n", $mutex)
-	mutex_stacks[$mutex] = sprint_ubacktrace()
-      }
-    }
-  }
 }
 
 probe end {
