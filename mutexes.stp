@@ -1,0 +1,98 @@
+//!/usr/bin/stap
+//
+// This script identifies contended mutex locks by a stack trace.
+// Run with -x and -d for a particular process, e.g. for qpidd:
+//
+//     sudo stap ~/stap/mutexes.stp -x $(pidof qpidd) -d $(which qpidd) --ldd -v
+//
+// While the script is running, it prints the address of each contended mutex
+// on the first contended lock to show progress.
+//
+// When the script is killed (Ctrl-C or kill -int) it prints statistics for
+// contended lock wait times and a stack trace to one of the contended lock locations
+// for the most contended locks.
+//
+// Filter the output with c++filt to get readable C++ function names.
+//
+// NOTE: You'll need to install debuginfo for the pthread libraries, e.g. on RHEL/Fedora:
+//     sudo debuginfo-install glibc
+//
+// TODO:
+//
+// The trace gives an address, function and library. Would be nice to
+// convert the address into a file:line to precisely identify the
+// lock statement. addr2line should be able to do this but haven't figured it
+// out yet.
+//
+// Might also be interesting to do statistics by contended lock
+// location rather than by mutex.
+//
+
+global thread_contended		  // time of latest contended lock call on thread.
+global mutex_waits                // stats on contended wait times by mutex.
+global mutex_locks		  // number of threads currently attempting to lock mutex.
+global mutex_stacks		  // stack traces per mutex
+global mutex_missed		  // possibly missed contention
+
+probe process("/lib64/libpthread.so.0").function("pthread_mutex_lock") {
+  if (target() == pid()) {
+    if (++mutex_locks[$mutex] > 1) // Contended
+	thread_contended[tid()] = gettimeofday_us();
+  }
+}
+
+probe process("/lib64/libpthread.so.0").function("pthread_mutex_lock").return {
+  // Note: this is lock.return so at this point the current thread is holding
+  // the lock. No other thread can modify mutex_waits[$mutex] till this thread
+  // calls unlock.
+  if (target() == pid()) {
+    contended = thread_contended[tid()];
+    if (contended) {
+      delete thread_contended[tid()]
+      mutex_waits[$mutex] <<< (gettimeofday_us() - contended);
+      if (@count(mutex_waits[$mutex]) == 1) {   // First contention of this mutex
+	printf ("mutex %p: contended\n", $mutex)
+	// We need to print the stack trace here, not in end() to get a useful trace.
+	mutex_stacks[$mutex] = sprint_ubacktrace()
+      }
+    }
+  }
+}
+
+probe process("/lib64/libpthread.so.0").function("pthread_mutex_unlock") {
+  if (target() == pid()) {
+    // TODO: There is a race here:
+    // - this thread does --mutex_locks[$mutex] and sees 0
+    // - another thread hits the lock probe and does ++mutex_locks[$mutex]
+    // - this thread does delete mutex_locks[$mutex] and nukes a non-0 value
+    // Consequence: we could miss contentions.
+    // We detect if this happens (eventually we'll get count < 0) and report it.
+    //
+    count = --mutex_locks[$mutex]
+    if (count <= 0)
+      delete mutex_locks[$mutex];
+    if (count < 0) {
+      if (++mutex_missed[$mutex] == 1) {
+	printf("mutex %p: invalid lock count\n", $mutex)
+	mutex_stacks[$mutex] = sprint_ubacktrace()
+      }
+    }
+  }
+}
+
+probe end {
+  printf("\n\nContended mutexes, most frequent first\n\n")
+  foreach ([m] in mutex_waits- limit 100) {
+    printf ("==== mutex %p contended %d times, %dus total, %dus avg\n",
+	    m,
+	    @count(mutex_waits[m]),
+	    @sum(mutex_waits[m]),
+	    @avg(mutex_waits[m]))
+    printf("%s\n\n", mutex_stacks[m])
+  }
+  printf("\n\nInvalid lock counts, possibly missed contention\n\n")
+  foreach ([m] in mutex_missed- limit 100) {
+    printf ("==== mutex %p: detected invalid lock count %d times\n", m, mutex_missed[m])
+    printf("%s\n\n", mutex_stacks[m])
+  }
+}
